@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import List, Tuple, Dict
 import pandas as pd
 import numpy as np
+import time
+import faiss
 
 logger = structlog.get_logger()
 data_dir = Path(__file__).resolve().parent.parent / "data"
@@ -70,6 +72,7 @@ class ContentBasedRecommender:
     def preprocess_text(self, df: pd.DataFrame) -> pd.DataFrame:
         """Preprocess Korean text columns (title and description)"""
         logger.info(f"Preprocessing text for {len(df)} videos")
+        start_time = time.perf_counter()
         # Create copies to avoid modifying the original dataframe
         df_processed = df.copy()
         
@@ -79,12 +82,14 @@ class ContentBasedRecommender:
         
         # Combine text features
         df_processed['text_combined'] = df_processed['title_tokenized'] + " " + df_processed['description_tokenized']
-        
+        end_time = time.perf_counter()
+        logger.info(f"Total execution time: {end_time - start_time:.4f} seconds.")
         return df_processed
     
     def extract_text_features(self, df: pd.DataFrame) -> np.ndarray:
         """Extract TF-IDF features from preprocessed text"""
         logger.info("Extracting text features")
+        start_time = time.perf_counter()
         if self.text_vectorizer is None:
             # Initialize and fit vectorizer if not already done
             self.text_vectorizer = TfidfVectorizer(
@@ -98,12 +103,14 @@ class ContentBasedRecommender:
         else:
             # Use pre-trained vectorizer
             text_features = self.text_vectorizer.transform(df['text_combined'])
-            
+        end_time = time.perf_counter()
+        logger.info(f"Total execution time: {end_time - start_time:.4f} seconds.")
         return text_features
     
     def extract_metadata_features(self, df: pd.DataFrame) -> np.ndarray:
         """Extract and encode numerical and categorical metadata features"""
         logger.info("Extracting metadata features")
+        start_time = time.perf_counter()
         # Handle numerical features
         numerical_features = df[['tree_consumed', 'video_duration']].values
         scaled_numerical = self.numerical_scaler.fit_transform(numerical_features)
@@ -114,13 +121,16 @@ class ContentBasedRecommender:
         
         # Combine all metadata features
         metadata_features = np.hstack((scaled_numerical, encoded_categorical))
-        
+
+        end_time = time.perf_counter()
+        logger.info(f"Total execution time: {end_time - start_time:.4f} seconds.")
         return metadata_features
     
     def combine_features(self, text_features: np.ndarray, metadata_features: np.ndarray, 
                          text_weight: float = 0.7) -> np.ndarray:
         """Combine text and metadata features with weighting"""
         logger.info(f"Combining features with text_weight={text_weight}")
+        start_time = time.perf_counter()
         # Normalize feature matrices
         text_norm = np.sqrt((text_features.toarray() ** 2).sum(axis=1))
         text_normalized = text_features.toarray() / text_norm[:, np.newaxis]
@@ -132,6 +142,8 @@ class ContentBasedRecommender:
         combined_features = (text_weight * text_normalized + 
                              (1 - text_weight) * metadata_normalized)
         
+        end_time = time.perf_counter()
+        logger.info(f"Total execution time: {end_time - start_time:.4f} seconds.")
         return combined_features
     
     def build_faiss_index(self, feature_matrix: np.ndarray) -> None:
