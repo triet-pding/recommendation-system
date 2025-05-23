@@ -7,13 +7,13 @@ from scipy import stats
 from scipy.sparse import csr_matrix
 from sklearn.metrics.pairwise import cosine_similarity
 from collections import defaultdict
-from typing import List, Tuple, Union, Dict
-from functools import lru_cache
+from typing import List, Tuple, Union, Dict, Optional, Any
 import pickle
-from scipy import sparse
 import structlog
 from scipy.sparse import lil_matrix
 from recommendation_config import RecommendationConfig
+from cache_manager import CacheManager
+from pathlib import Path
 
 logger = structlog.get_logger()
 
@@ -37,9 +37,11 @@ class ItemBasedCFRecommender:
         similarity_threshold : float, default=0.0
             Minimum similarity threshold for considering items related
         """
+
         self.top_n_similar = config.get('top_n_similar', 10)
         self.similarity_threshold = config.get('similarity_threshold', 0.0)
 
+        # Model state
         self.user_item_matrix = None
         self.item_similarity_matrix = None
         self.user_mapping = None
@@ -47,21 +49,53 @@ class ItemBasedCFRecommender:
         self.reverse_user_mapping = None
         self.reverse_item_mapping = None
         self.popular_items_cache = None
+        self.model_metadata = {}
+
 
         self.cache_size = config.get('lru_cache_max_size', 1000)
         self.model_dir = config.get('model_dir') / "cf_models"
+        self.model_dir.mkdir(parents=True, exist_ok=True)
         
-        # Configure the LRU cache decorators
-        self._configure_caches()
+        self.use_cache = config.get('use_cache', False)
+        self.cache_manager = None
+        self.cache_ttl = config.get('cache_ttl', 3600)
+
+        if self.use_cache:
+            try:
+                self.cache_manager = CacheManager(config)
+                logger.info("Cache manager initialized successfully")
+            except Exception as e:
+                logger.warning(f"Failed to initialize cache manager: {e}")
+                self.use_cache = False
         
-    def _configure_caches(self):
-        """Configure LRU caches with the specified size"""
-        # Make the recommend_for_user method use LRU cache
-        self.recommend_for_user = lru_cache(maxsize=self.cache_size)(self._recommend_for_user)
-        # Make the recommend_similar_items method use LRU cache
-        self.recommend_similar_items = lru_cache(maxsize=self.cache_size)(self._recommend_similar_items)
+        # Performance tracking
+        self.fit_time = None
+        self.model_stats = {}
+
+    def _validate_rating_data(self, ratings_df: pd.DataFrame) -> pd.DataFrame:
+        """Validate and clean the ratings DataFrame."""
+        logger.info("Validating ratings data...")
         
-    def fit(self, ratings_df: pd.DataFrame):
+        # Check required columns
+        required_cols = ['user_id', 'video_id', 'rating']
+        missing_cols = [col for col in required_cols if col not in ratings_df.columns]
+        if missing_cols:
+            raise ValueError(f"Missing required columns: {missing_cols}")
+        
+        # Remove rows with missing values
+        initial_rows = len(ratings_df)
+        ratings_df = ratings_df.dropna(subset=required_cols)
+        if len(ratings_df) < initial_rows:
+            logger.warning(f"Removed {initial_rows - len(ratings_df)} rows with missing values")
+        
+        # Convert data types
+        try:
+            ratings_df['rating'] = pd.to_numeric(ratings_df['rating'], errors='coerce')
+            ratings_df = ratings_df.dropna(subset=['rating'])
+        except Exception as e:
+            raise ValueError(f"Error converting ratings to numeric: {e}")
+        
+    def fit(self, ratings_df: pd.DataFrame, save_model: bool = True):
         """
         Build the item-based collaborative filtering model.
         
@@ -72,115 +106,320 @@ class ItemBasedCFRecommender:
         """
         logger.info("Starting model fitting...")
         start_time = time.time()
+
+        # Clear cache before retraining (important!)
+        if hasattr(self, 'cache_manager') and self.cache_manager:
+            logger.info("Clearing cache before retraining...")
+            self.clear_cache()
         
-        # Create mappings between original IDs and matrix indices
-        self._create_mappings(ratings_df)
+        try:
+            # Validate input data
+            ratings_df = self._validate_rating_data(ratings_df)
+
+            if len(ratings_df) == 0:
+                raise ValueError("No valid ratings data after filtering")
+            
+            # Create mappings between original IDs and matrix indices
+            self._create_mappings(ratings_df)
+            
+            # Build the user-item matrix
+            self._build_user_item_matrix(ratings_df)
+            
+            # Calculate item similarity matrix
+            self._build_item_similarity_matrix()
+
+            # Pre-compute popular items to use as fallback
+            self._compute_popular_items()
+
+            # Store model metadata
+            self.fit_time = time.time() - start_time
+            self.model_metadata = {
+                'n_users': len(self.user_mapping),
+                'n_items': len(self.item_mapping),
+                'n_ratings': len(ratings_df),
+                'sparsity': 1 - (len(ratings_df) / (len(self.user_mapping) * len(self.item_mapping))),
+                'fit_time': self.fit_time,
+                'similarity_threshold': self.similarity_threshold,
+                'top_n_similar': self.top_n_similar
+            }
+            
+            logger.info(f"Model fitting completed in {self.fit_time:.2f} seconds")
+            logger.info(f"Model stats: {self.model_metadata}")
+            
+            # Save model if requested
+            if save_model:
+                self.save_model()
         
-        # Build the user-item matrix
-        self._build_user_item_matrix(ratings_df)
-        
-        # Calculate item similarity matrix
-        self._build_item_similarity_matrix()
-        
-        # Pre-compute popular items to use as fallback
-        self.popular_items_cache = self.recommend_popular_items_wilson()
-        
-        logger.info(f"Model fitting completed in {time.time() - start_time:.2f} seconds")
+        except Exception as e:
+            logger.error(f"Error during model fitting: {e}")
+            raise
         
     def _create_mappings(self, ratings_df: pd.DataFrame):
         """Create mappings between original IDs and matrix indices."""
         logger.info("Creating user and item mappings...")
         
-        # Get unique users and items
-        unique_users = ratings_df['user_id'].unique()
-        unique_items = ratings_df['video_id'].unique()
+        try:
+            # Get unique users and items
+            unique_users = ratings_df['user_id'].unique()
+            unique_items = ratings_df['video_id'].unique()
+            
+            # Create mappings
+            self.user_mapping = {user: idx for idx, user in enumerate(unique_users)}
+            self.item_mapping = {item: idx for idx, item in enumerate(unique_items)}
+            
+            # Create reverse mappings (index to original ID)
+            self.reverse_user_mapping = {idx: user for user, idx in self.user_mapping.items()}
+            self.reverse_item_mapping = {idx: item for item, idx in self.item_mapping.items()}
+            
+            logger.info(f"Found {len(unique_users)} unique users and {len(unique_items)} unique videos")
         
-        # Create mappings
-        self.user_mapping = {user: idx for idx, user in enumerate(unique_users)}
-        self.item_mapping = {item: idx for idx, item in enumerate(unique_items)}
-        
-        # Create reverse mappings (index to original ID)
-        self.reverse_user_mapping = {idx: user for user, idx in self.user_mapping.items()}
-        self.reverse_item_mapping = {idx: item for item, idx in self.item_mapping.items()}
-        
-        logger.info(f"Found {len(unique_users)} unique users and {len(unique_items)} unique videos")
+        except Exception as e:
+            logger.error(f"Error creating mappings: {e}")
+            raise
         
     def _build_user_item_matrix(self, ratings_df: pd.DataFrame):
         """Build the user-item matrix from the ratings DataFrame."""
         logger.info("Building user-item matrix...")
         
-        # Convert IDs to matrix indices
-        user_indices = [self.user_mapping[user] for user in ratings_df['user_id']]
-        item_indices = [self.item_mapping[item] for item in ratings_df['video_id']]
+        try:
+
+            # Convert IDs to matrix indices
+            user_indices = [self.user_mapping[user] for user in ratings_df['user_id']]
+            item_indices = [self.item_mapping[item] for item in ratings_df['video_id']]
+            
+            # Create sparse matrix
+            n_users = len(self.user_mapping)
+            n_items = len(self.item_mapping)
+            
+            # Convert ratings to float values
+            ratings = ratings_df['rating'].values.astype(float)
+            
+            # Create the sparse matrix
+            self.user_item_matrix = csr_matrix((ratings, 
+                                                (user_indices, item_indices)), 
+                                                shape=(n_users, n_items))
+            
+            # Eliminate duplicate entries by summing them
+            self.user_item_matrix.eliminate_zeros()
+            
+            logger.info(f"Created user-item matrix of shape {self.user_item_matrix.shape} "
+                       f"with {self.user_item_matrix.nnz} non-zero entries")
         
-        # Create sparse matrix
-        n_users = len(self.user_mapping)
-        n_items = len(self.item_mapping)
+        except Exception as e:
+            logger.error(f"Error building user-item matrix: {e}")
+            raise
         
-        # Convert ratings to float values
-        ratings = ratings_df['rating'].values.astype(float)
-        
-        # Create the sparse matrix
-        self.user_item_matrix = csr_matrix((ratings, (user_indices, item_indices)), 
-                                          shape=(n_users, n_items))
-        
-        logger.info(f"Created user-item matrix of shape {self.user_item_matrix.shape}")
-        
-    def _build_item_similarity_matrix(self, batch_size: int = 1000):
-        """Calculate the item-item similarity matrix using cosine similarity."""
+    def _build_item_similarity_matrix(self):
+        """Calculate item-item similarity matrix with memory-efficient processing."""
         logger.info("Building item similarity matrix...")
         start_time = time.time()
         
-        # Convert to item-user matrix (transpose)
-        item_user_matrix = self.user_item_matrix.T.tocsr()
-        
-        # Calculate similarity matrix
-        n_items = item_user_matrix.shape[0]
-        self.item_similarity_matrix = {}
-        
-        # Process items in batches to reduce memory usage
-        
-        for batch_start in range(0, n_items, batch_size):
-            batch_end = min(batch_start + batch_size, n_items)
-            if batch_start > 0:
-                logger.info(f"Processing batch {batch_start//batch_size + 1}/{(n_items + batch_size - 1)//batch_size}...")
+        try:
+            # Convert to item-user matrix (transpose)
+            item_user_matrix = self.user_item_matrix.T.tocsr()
+            n_items = item_user_matrix.shape[0]
             
-            # Extract the batch of item vectors
-            batch_vectors = item_user_matrix[batch_start:batch_end].toarray()
+            # Initialize similarity matrix as dictionary for memory efficiency
+            self.item_similarity_matrix = {}
+            similarity_count = 0
             
-            # Calculate similarities with all items at once for this batch
-            similarities = cosine_similarity(batch_vectors, item_user_matrix.toarray())
+            # Process items in batches to reduce memory usage
+            for batch_start in range(0, n_items, self.batch_size):
+                batch_end = min(batch_start + self.batch_size, n_items)
+                
+                if batch_start % (self.batch_size * 10) == 0:  # Log every 10 batches
+                    logger.info(f"Processing similarity batch {batch_start//self.batch_size + 1}/"
+                               f"{(n_items + self.batch_size - 1)//self.batch_size}")
+                
+                try:
+                    # Calculate similarities for this batch
+                    batch_similarities = self._calculate_batch_similarities(
+                        item_user_matrix, batch_start, batch_end
+                    )
+                    
+                    # Store similarities
+                    for i, item_idx in enumerate(range(batch_start, batch_end)):
+                        similarities = batch_similarities[i]
+                        
+                        # Filter by threshold and get top N
+                        valid_sims = [(idx, sim) for idx, sim in enumerate(similarities) 
+                                     if sim > self.similarity_threshold and idx != item_idx]
+                        
+                        if valid_sims:
+                            # Sort and take top N
+                            valid_sims.sort(key=lambda x: x[1], reverse=True)
+                            top_sims = valid_sims[:self.top_n_similar]
+                            
+                            # Store as dictionary
+                            self.item_similarity_matrix[item_idx] = {
+                                idx: sim for idx, sim in top_sims
+                            }
+                            similarity_count += len(top_sims)
+                
+                except Exception as e:
+                    logger.warning(f"Error processing batch {batch_start}-{batch_end}: {e}")
+                    continue
             
-            # Process each item in the batch
-            for i, item_idx in enumerate(range(batch_start, batch_end)):
-                # Set self-similarity to -1 to exclude it
-                similarities[i, item_idx] = -1
-                
-                # Filter by threshold before finding top N
-                valid_indices = np.where(similarities[i] > self.similarity_threshold)[0]
-                
-                # Get top N similar items
-                if len(valid_indices) > self.top_n_similar:
-                    # Use argpartition for efficiency (O(n) instead of O(n log n) for full sort)
-                    top_indices = np.argpartition(similarities[i, valid_indices], -self.top_n_similar)[-self.top_n_similar:]
-                    top_similar_indices = valid_indices[top_indices]
-                else:
-                    top_similar_indices = valid_indices
-                
-                # Store only nonzero similarities in a dictionary (sparse representation)
-                self.item_similarity_matrix[item_idx] = {
-                    sim_idx: similarities[i, sim_idx] 
-                    for sim_idx in top_similar_indices 
-                    if similarities[i, sim_idx] > 0
-                }
-        
-        logger.info(f"Item similarity matrix built in {time.time() - start_time:.2f} seconds")
-        
-        # Calculate memory usage
-        similarity_size = sum(len(similarities) for similarities in self.item_similarity_matrix.values())
-        logger.info(f"Item similarity matrix contains {similarity_size} nonzero elements")
+            build_time = time.time() - start_time
+            logger.info(f"Item similarity matrix built in {build_time:.2f} seconds")
+            logger.info(f"Stored {similarity_count} similarity relationships")
+            
+        except Exception as e:
+            logger.error(f"Error building similarity matrix: {e}")
+            raise
 
-    def _wilson_score(self, pos: Union[int, float], n: int, confidence: float = 0.95):
+    def _calculate_batch_similarities(self, item_user_matrix, batch_start: int, batch_end: int) -> np.ndarray:
+        """Calculate similarities for a batch of items with error handling."""
+        try:
+            # Extract batch vectors
+            batch_vectors = item_user_matrix[batch_start:batch_end]
+            
+            # Convert to dense for similarity calculation (only for the batch)
+            batch_dense = batch_vectors.toarray()
+            
+            # Calculate similarities with all items
+            similarities = cosine_similarity(batch_dense, item_user_matrix)
+            
+            return similarities
+            
+        except MemoryError:
+            logger.warning(f"Memory error in batch {batch_start}-{batch_end}, using smaller sub-batches")
+            # Fall back to smaller sub-batches
+            sub_batch_size = max(1, (batch_end - batch_start) // 4)
+            results = []
+            
+            for sub_start in range(batch_start, batch_end, sub_batch_size):
+                sub_end = min(sub_start + sub_batch_size, batch_end)
+                sub_vectors = item_user_matrix[sub_start:sub_end].toarray()
+                sub_similarities = cosine_similarity(sub_vectors, item_user_matrix)
+                results.extend(sub_similarities)
+            
+            return np.array(results)
+        
+    def _compute_popular_items(self):
+        """Pre-compute popular items using Wilson score with error handling."""
+        logger.info("Computing popular items...")
+        
+        try:
+            popular_items = self.recommend_popular_items_wilson(n_recommendations=50)
+            self.popular_items_cache = popular_items
+            logger.info(f"Cached {len(popular_items)} popular items")
+            
+        except Exception as e:
+            logger.warning(f"Error computing popular items: {e}")
+            # Fallback to simple popularity
+            try:
+                item_counts = np.array(self.user_item_matrix.sum(axis=0))[0]
+                top_items = np.argsort(item_counts)[::-1][:50]
+                self.popular_items_cache = [
+                    (self.reverse_item_mapping[idx], item_counts[idx]) 
+                    for idx in top_items if item_counts[idx] > 0
+                ]
+            except Exception as fallback_error:
+                logger.error(f"Fallback popular items computation failed: {fallback_error}")
+                self.popular_items_cache = []
+
+    def recommend_for_user(self, user_id: str, n_recommendations: int = 10, 
+                          exclude_watched: bool = True) -> List[Tuple[str, float]]:
+        """
+        Generate personalized recommendations for a user with caching and error handling.
+        """
+        # Generate cache key
+        cache_key = None
+        if self.use_cache and self.cache_manager:
+            cache_key = self.cache_manager._generate_cache_key(
+                "user_rec", user_id, n_recommendations, exclude_watched
+            )
+            
+            # Try to get from cache
+            try:
+                cached_result = self.cache_manager.get(cache_key)
+                if cached_result is not None:
+                    logger.debug(f"Cache hit for user {user_id}")
+                    return cached_result
+            except Exception as e:
+                logger.warning(f"Cache get error: {e}")
+        
+        try:
+            # Generate recommendations
+            recommendations = self._recommend_for_user(user_id, n_recommendations, exclude_watched)
+            
+            # Cache the result
+            if self.use_cache and self.cache_manager and cache_key:
+                try:
+                    self.cache_manager.set(cache_key, recommendations, self.cache_ttl)
+                except Exception as e:
+                    logger.warning(f"Cache set error: {e}")
+            
+            return recommendations
+            
+        except Exception as e:
+            logger.error(f"Error generating recommendations for user {user_id}: {e}")
+            # Return popular items as fallback
+            return self.popular_items_cache[:n_recommendations] if self.popular_items_cache else []
+        
+    def _recommend_for_user(self, user_id: str, n_recommendations: int = 10, 
+                           exclude_watched: bool = True) -> List[Tuple[str, float]]:
+        """Internal method for generating user recommendations."""
+        
+        # Check if user exists
+        if user_id not in self.user_mapping:
+            logger.info(f"User {user_id} not found in training data")
+            return self.popular_items_cache[:n_recommendations] if self.popular_items_cache else []
+        
+        user_idx = self.user_mapping[user_id]
+        user_vector = self.user_item_matrix[user_idx]
+        
+        if user_vector.nnz == 0:
+            logger.info(f"User {user_id} has no ratings")
+            return self.popular_items_cache[:n_recommendations] if self.popular_items_cache else []
+        
+        # Get user's ratings
+        watched_items = user_vector.indices
+        watched_ratings = user_vector.data
+        
+        # Calculate recommendation scores
+        scores = defaultdict(float)
+        total_similarity = defaultdict(float)
+        
+        for idx, item_idx in enumerate(watched_items):
+            item_rating = watched_ratings[idx]
+            
+            # Skip very low ratings (configurable threshold)
+            if item_rating < 3:
+                continue
+            
+            # Get similar items
+            if item_idx in self.item_similarity_matrix:
+                for similar_item, similarity in self.item_similarity_matrix[item_idx].items():
+                    if exclude_watched and similar_item in watched_items:
+                        continue
+                    
+                    # Weighted score
+                    scores[similar_item] += similarity * item_rating
+                    total_similarity[similar_item] += similarity
+        
+        # Normalize scores
+        normalized_scores = {
+            item_idx: score / total_similarity[item_idx] if total_similarity[item_idx] > 0 else 0
+            for item_idx, score in scores.items()
+        }
+        
+        if not normalized_scores:
+            return self.popular_items_cache[:n_recommendations] if self.popular_items_cache else []
+        
+        # Get top recommendations
+        top_items = heapq.nlargest(n_recommendations, normalized_scores.keys(), 
+                                  key=normalized_scores.get)
+        
+        recommendations = [
+            (self.reverse_item_mapping[item_idx], normalized_scores[item_idx])
+            for item_idx in top_items
+        ]
+        
+        return recommendations
+
+    def _wilson_score(self, pos: Union[int, float], n: int, confidence: float = 0.95) -> float:
         """
         Calculate the Wilson score interval for a binomial proportion.
         
@@ -198,301 +437,176 @@ class ItemBasedCFRecommender:
         float
             Lower bound of Wilson score interval
         """
-        if n == 0:
-            return 0
+        if n <= 0:
+            return 0.0
         
-        # Handle case where pos > n (which can happen when using sum of ratings)
-        if pos > n:
-            # For Wilson score calculation, proportion must be between 0 and 1
-            # Normalize the positive score to be within valid range
-            phat = 1.0
-        else:
-            phat = pos / n
+        # Ensure pos is within valid range
+        pos = max(0, min(pos, n))
+        phat = pos / n
         
-        z = stats.norm.ppf(1 - (1 - confidence) / 2)
-        
-        # Ensure phat is in the valid range [0, 1]
-        phat = min(max(phat, 0), 1)
-        
-        # Wilson score calculation
-        score = (phat + z*z/(2*n) - z * math.sqrt((phat*(1-phat) + z*z/(4*n))/n)) / (1 + z*z/n)
-        
-        return score
-
-    def recommend_popular_items_wilson(self, n_recommendations: int = 10, confidence: float = 0.95, normalize_ratings: bool = True):
-        """
-        Recommend most popular items based on Wilson score.
-        Used as fallback for cold-start users.
-        
-        Parameters:
-        -----------
-        n_recommendations : int, default=10
-            Number of recommendations to generate
-        confidence : float, default=0.95
-            Confidence level for Wilson score
-        normalize_ratings : bool, default=True
-            Whether to normalize ratings to 0-1 range
-                
-        Returns:
-        --------
-        list of tuples
-            List of (video_id, wilson_score) tuples
-        """
-        # Convert user-item matrix to array for easier processing
-        # Use CSR matrix methods to avoid full conversion to dense array
-        ratings_sum = np.array(self.user_item_matrix.sum(axis=0))[0]
-        
-        # Count nonzero elements per column (number of ratings per item)
-        ratings_count = np.array(self.user_item_matrix.getnnz(axis=0))
-        
-        # Prepare to store results
-        wilson_scores = []
-        
-        # Process each item
-        for item_idx in range(self.user_item_matrix.shape[1]):
-            # Skip items with no ratings
-            if ratings_count[item_idx] == 0:
-                wilson_scores.append(0)
-                continue
-            
-            if normalize_ratings:
-                # For normalized ratings, we need to fetch the actual ratings
-                # Get the column for this item
-                col = self.user_item_matrix.getcol(item_idx)
-                # Extract nonzero values
-                ratings = col.data
-                
-                # Normalize ratings to 0-1 range (assuming 1-5 scale)
-                # Ensure we handle ratings outside the expected range
-                min_rating = 1  # Minimum expected rating
-                max_rating = 5  # Maximum expected rating
-                norm_ratings = np.clip((ratings - min_rating) / (max_rating - min_rating), 0, 1)
-                pos = np.sum(norm_ratings)
-                # Use number of ratings as n for normalized case
-                n = len(ratings)
-            else:
-                # Use sum of ratings as "positive" outcome
-                pos = ratings_sum[item_idx]
-                # For non-normalized case, we need a reasonable denominator
-                # We'll use the maximum possible rating sum (n * max_rating)
-                n = ratings_count[item_idx] * 5  # Assuming 5 is the max rating
-            
-            # Calculate Wilson score
-            score = self._wilson_score(pos, n, confidence)
-            wilson_scores.append(score)
-        
-        # Use numpy for efficient top-N selection
-        if n_recommendations >= len(wilson_scores):
-            top_indices = np.argsort(wilson_scores)[::-1]
-        else:
-            # Use argpartition for more efficient selection
-            top_indices = np.argpartition(wilson_scores, -n_recommendations)[-n_recommendations:]
-            # Sort the top N
-            top_indices = top_indices[np.argsort([-wilson_scores[i] for i in top_indices])]
-        
-        # Convert to original video IDs
-        recommendations = [
-            (self.reverse_item_mapping[idx], wilson_scores[idx])
-            for idx in top_indices
-        ]
-        
-        return recommendations
-    
-    def _recommend_for_user(self, user_id: str, n_recommendations: int = 10, exclude_watched: bool = True) -> List[Tuple]:
-        """
-        Generate personalized recommendations for a user.
-        This internal method does the actual work and is wrapped by the cached public method.
-        
-        Parameters:
-        -----------
-        user_id : str
-            Original user ID
-        n_recommendations : int, default=10
-            Number of recommendations to generate
-        exclude_watched : bool, default=True
-            Whether to exclude videos the user has already watched
-            
-        Returns:
-        --------
-        list of tuples
-            List of (video_id, predicted_rating) tuples
-        """
-        # Check if user exists in training data
-        if user_id not in self.user_mapping:
-            logger.info(f"User {user_id} not found in training data. Using popular items instead.")
-            return self.popular_items_cache[:n_recommendations]
-        
-        # Get user index
-        user_idx = self.user_mapping[user_id]
-        
-        # Get user's ratings efficiently from sparse matrix
-        user_vector = self.user_item_matrix[user_idx]
-        watched_items = user_vector.indices
-        watched_ratings = user_vector.data
-        
-        if len(watched_items) == 0:
-            logger.info(f"User {user_id} has no ratings. Using popular items instead.")
-            return self.popular_items_cache[:n_recommendations]
-        
-        # Initialize recommendation scores as sparse dictionary for efficiency
-        scores = defaultdict(float)
-        total_similarity = defaultdict(float)
-        
-        # For each rated item
-        for idx, item_idx in enumerate(watched_items):
-            # Get user's rating for this item
-            item_rating = watched_ratings[idx]
-            
-            # Skip low ratings (optional - you might want to consider negative feedback)
-            if item_rating < 3:
-                continue
-                
-            # Get similar items
-            if item_idx in self.item_similarity_matrix:
-                # For each similar item
-                for similar_item, similarity in self.item_similarity_matrix[item_idx].items():
-                    # Skip if user has already watched this item and we want to exclude watched
-                    if exclude_watched and similar_item in watched_items:
-                        continue
-                    
-                    # Weight by both rating and similarity
-                    scores[similar_item] += similarity * item_rating
-                    # Track total similarity for normalization
-                    total_similarity[similar_item] += similarity
-        
-        # Normalize scores by total similarity for more stable predictions
-        normalized_scores = {
-            item_idx: score/total_similarity[item_idx] if total_similarity[item_idx] > 0 else score
-            for item_idx, score in scores.items()
-        }
-        
-        # If we have no recommendations after filtering
-        if len(normalized_scores) == 0:
-            return self.popular_items_cache[:n_recommendations]
-        
-        # Sort by score and take top N
-        top_item_indices = heapq.nlargest(n_recommendations, 
-                                         normalized_scores.keys(), 
-                                         key=normalized_scores.get)
-        
-        # Convert back to original video IDs
-        recommendations = [
-            (self.reverse_item_mapping[item_idx], normalized_scores[item_idx])
-            for item_idx in top_item_indices
-        ]
-        
-        return recommendations
-    
-    def _recommend_similar_items(self, video_id: str, n_recommendations=10) -> List:
-        """
-        Find videos similar to a given video.
-        This internal method does the actual work and is wrapped by the cached public method.
-        
-        Parameters:
-        -----------
-        video_id : str
-            Original video ID
-        n_recommendations : int, default=10
-            Number of similar videos to recommend
-            
-        Returns:
-        --------
-        list of tuples
-            List of (video_id, similarity_score) tuples
-        """
-        # Check if item exists in training data
-        if video_id not in self.item_mapping:
-            logger.info(f"Video {video_id} not found in training data.")
-            return []
-        
-        # Get item index
-        item_idx = self.item_mapping[video_id]
-        
-        # If no similarity data for this item
-        if item_idx not in self.item_similarity_matrix:
-            logger.info(f"No similarity data for video {video_id}.")
-            return []
-        
-        # Get similar items
-        similar_items = self.item_similarity_matrix[item_idx]
-        
-        # Sort by similarity and take top N
-        top_similar = heapq.nlargest(n_recommendations, 
-                                    similar_items.keys(), 
-                                    key=similar_items.get)
-        
-        # Convert back to original video IDs
-        recommendations = [
-            (self.reverse_item_mapping[sim_idx], similar_items[sim_idx])
-            for sim_idx in top_similar
-        ]
-        
-        return recommendations
-    
-    def clear_caches(self):
-        """Clear all LRU caches to free memory or refresh recommendations"""
-        self.recommend_for_user.cache_clear()
-        self.recommend_similar_items.cache_clear()
-    
-    def save_model(self, filepath: str, model_file_name:str):
-        """Save the model to disk"""
-        
-        # Create a dictionary with the model data
-        model_data = {
-            'user_mapping': self.user_mapping,
-            'item_mapping': self.item_mapping,
-            'reverse_user_mapping': self.reverse_user_mapping,
-            'reverse_item_mapping': self.reverse_item_mapping,
-            'item_similarity_matrix': self.item_similarity_matrix,
-            'popular_items_cache': self.popular_items_cache,
-            'top_n_similar': self.top_n_similar,
-            'similarity_threshold': self.similarity_threshold,
-            'cache_size': self.cache_size
-        }
-        
-        # Save sparse matrix separately for efficiency
-        if self.user_item_matrix is not None:
-            
-            sparse.save_npz(f"{filepath}/{model_file_name}_user_item_matrix.npz", self.user_item_matrix)
-            
-        # Save the rest of the data
-        with open(f"{filepath}/{model_file_name}", 'wb') as f:
-            pickle.dump(model_data, f)
-        
-        logger.info(f"Model saved to {filepath}")
-    
-    @classmethod
-    def load_model(cls, filepath: str):
-        """Load a saved model from disk"""
-        import pickle
-        from scipy import sparse
-        
-        # Load the model data
-        with open(filepath, 'rb') as f:
-            model_data = pickle.load(f)
-        
-        # Create a new instance
-        instance = cls(
-            top_n_similar=model_data['top_n_similar'],
-            cache_size=model_data['cache_size'],
-            similarity_threshold=model_data['similarity_threshold']
-        )
-        
-        # Load the attributes
-        instance.user_mapping = model_data['user_mapping']
-        instance.item_mapping = model_data['item_mapping']
-        instance.reverse_user_mapping = model_data['reverse_user_mapping']
-        instance.reverse_item_mapping = model_data['reverse_item_mapping']
-        instance.item_similarity_matrix = model_data['item_similarity_matrix']
-        instance.popular_items_cache = model_data['popular_items_cache']
-        
-        # Load sparse matrix if it exists
         try:
-            instance.user_item_matrix = sparse.load_npz(f"{filepath}_user_item_matrix.npz")
-        except FileNotFoundError:
-            logger.info("User-item matrix file not found, loading only the similarity data")
+            z = stats.norm.ppf(1 - (1 - confidence) / 2)
+            
+            # Wilson score calculation with numerical stability
+            denominator = 1 + z*z/n
+            if denominator == 0:
+                return 0.0
+            
+            score = (phat + z*z/(2*n) - z * math.sqrt((phat*(1-phat) + z*z/(4*n))/n)) / denominator
+            return max(0.0, score)  # Ensure non-negative
+            
+        except (ValueError, ZeroDivisionError, OverflowError) as e:
+            logger.warning(f"Wilson score calculation error: {e}")
+            return phat  # Fallback to simple proportion
+
+    def recommend_popular_items_wilson(self, n_recommendations: int = 10, 
+                                   confidence: float = 0.95, 
+                                   normalize_ratings: bool = True) -> List[Tuple[str, float]]:
+        """
+        Recommend popular items using Wilson score (normalized or unnormalized).
+        """
+        try:
+            n_items = self.user_item_matrix.shape[1]
+            wilson_scores = []
+
+            for item_idx in range(n_items):
+                col = self.user_item_matrix.getcol(item_idx)
+                ratings = col.data
+
+                if len(ratings) == 0:
+                    wilson_scores.append(0.0)
+                    continue
+
+                if normalize_ratings:
+                    norm_ratings = np.clip((ratings - 1) / 4, 0, 1)
+                    pos = np.sum(norm_ratings)
+                    n = len(norm_ratings)
+                else:
+                    pos = np.sum(ratings)
+                    n = len(ratings) * 5  # max possible sum
+
+                score = self._wilson_score(pos, n, confidence)
+                wilson_scores.append(score)
+
+            top_indices = np.argsort(wilson_scores)[::-1][:n_recommendations]
+            return [
+                (self.reverse_item_mapping[idx], wilson_scores[idx])
+                for idx in top_indices if wilson_scores[idx] > 0
+            ]
+
+        except Exception as e:
+            logger.error(f"Wilson score recommendation failed: {e}")
+            return []
+    
+    def save_model(self, filepath: Optional[str] = None):
+        """Save the trained model to disk."""
+        if filepath is None:
+            filepath = self.model_dir / "cf_model.pkl"
+        else:
+            filepath = Path(filepath)
         
-        return instance
+        try:
+            model_data = {
+                'user_item_matrix': self.user_item_matrix,
+                'item_similarity_matrix': self.item_similarity_matrix,
+                'user_mapping': self.user_mapping,
+                'item_mapping': self.item_mapping,
+                'reverse_user_mapping': self.reverse_user_mapping,
+                'reverse_item_mapping': self.reverse_item_mapping,
+                'popular_items_cache': self.popular_items_cache,
+                'model_metadata': self.model_metadata,
+                'config': {
+                    'top_n_similar': self.top_n_similar,
+                    'similarity_threshold': self.similarity_threshold,
+                    'min_interactions': self.min_interactions
+                }
+            }
+            
+            with open(filepath, 'wb') as f:
+                pickle.dump(model_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+            
+            logger.info(f"Model saved to {filepath}")
+            
+        except Exception as e:
+            logger.error(f"Error saving model: {e}")
+            raise
+    
+    def load_model(self, filepath: Optional[str] = None):
+        """Load a trained model from disk."""
+        if filepath is None:
+            filepath = self.model_dir / "cf_model.pkl"
+        else:
+            filepath = Path(filepath)
+        
+        try:
+            with open(filepath, 'rb') as f:
+                model_data = pickle.load(f)
+            
+            # Restore model state
+            self.user_item_matrix = model_data['user_item_matrix']
+            self.item_similarity_matrix = model_data['item_similarity_matrix']
+            self.user_mapping = model_data['user_mapping']
+            self.item_mapping = model_data['item_mapping']
+            self.reverse_user_mapping = model_data['reverse_user_mapping']
+            self.reverse_item_mapping = model_data['reverse_item_mapping']
+            self.popular_items_cache = model_data['popular_items_cache']
+            self.model_metadata = model_data.get('model_metadata', {})
+            
+            # Restore configuration
+            config = model_data.get('config', {})
+            self.top_n_similar = config.get('top_n_similar', self.top_n_similar)
+            self.similarity_threshold = config.get('similarity_threshold', self.similarity_threshold)
+            self.min_interactions = config.get('min_interactions', self.min_interactions)
+            
+            logger.info(f"Model loaded from {filepath}")
+            logger.info(f"Model metadata: {self.model_metadata}")
+
+            # Clear cache after loading new model
+            logger.info("Clearing cache after loading new model...")
+            self.clear_cache()
+            
+        except Exception as e:
+            logger.error(f"Error loading model: {e}")
+            raise
+
+    def get_model_info(self) -> Dict[str, Any]:
+        """Get information about the trained model."""
+        if not self.user_item_matrix:
+            return {"status": "not_trained"}
+        
+        return {
+            "status": "trained",
+            "metadata": self.model_metadata,
+            "cache_stats": {
+                "cache_hits": self.cache_manager.cache_hits if self.cache_manager else 0,
+                "cache_misses": self.cache_manager.cache_misses if self.cache_manager else 0,
+                "cache_enabled": self.use_cache
+            }
+        }
+    
+    def clear_cache(self):
+        """Clear the recommendation cache."""
+        if self.use_cache and self.cache_manager:
+            try:
+                if self.cache_manager.strategy == 'redis' and self.cache_manager.cache:
+                    # Clear Redis cache
+                    self.cache_manager.cache.flushdb()
+                    logger.info("Redis cache cleared successfully")
+                elif self.cache_manager.strategy == 'lru':
+                    # Clear LRU cache
+                    self.cache_manager.cache.clear()
+                    self.cache_manager.access_order.clear()
+                    logger.info("LRU cache cleared successfully")
+                
+                # Reset cache statistics
+                self.cache_manager.cache_hits = 0
+                self.cache_manager.cache_misses = 0
+                
+            except Exception as e:
+                logger.warning(f"Error clearing cache: {e}")
+        else:
+            logger.info("No cache to clear (caching disabled or not initialized)")
+
     
     def update_model(self, new_ratings_df: pd.DataFrame, 
                                       recalculate_similarities: bool = False):

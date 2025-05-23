@@ -60,74 +60,48 @@ class ContentBasedRecommender:
             self.cache_ttl = config.get('cache_ttl', 3600)
 
         logger.info("Content-based Recommender initialized")
-    
-    def _configure_cache(self, config: RecommendationConfig, cache_strategy: str) -> None:
-        """Configure the cache based on provided configuration"""
-        
-        if cache_strategy == 'redis':
-            try:
-                host = config.get('host', 'localhost')
-                port = config.get('port', 6379)
-                db = config.get('db', 0)
-                self.cache_ttl = config.get('ttl', 3600)
-                
-                self.cache = redis.Redis(host=host, port=port, db=db)
-                # Configure LRU eviction policy
-                try:
-                    self.cache.config_set('maxmemory-policy', 'allkeys-lru')
-                except redis.ResponseError:
-                    logger.warning("Could not set Redis maxmemory-policy. Make sure Redis is configured correctly.")
-                
-                logger.info(f"Redis cache configured at {host}:{port}/{db} with TTL={self.cache_ttl}s")
-            except ImportError:
-                logger.warning("Redis package not installed. Falling back to local cache.")
-                self._configure_local_cache(config)
-        else:
-            self._configure_local_cache(config)
 
-    def _configure_local_cache(self, config: RecommendationConfig) -> None:
-        """Configure a simple in-memory LRU cache"""
-        max_size = config.get('lru_cache_max_size', 1000)
-        
-        # Create a dictionary for the cache entries with expiration times
-        self.local_cache = {}
-        
-        # Create an LRU-cached version of the find_similar_videos method
-        @lru_cache(maxsize=max_size)
-        def cached_find_similar(vid_id: str, top_n: int):
-            return self._find_similar_videos_internal(vid_id, top_n)
-        
-        self.cached_find_similar = cached_find_similar
-        logger.info(f"Local LRU cache configured with max_size={max_size}")
         
     def _load_korean_stopwords(self):
         """Load Korean stopwords or use a default set if file not available"""
         logger.info("Load Korean stopwords list")
         try:
-            with open(f'{self.data_dir} / korean_stopwords.txt', 'r', encoding='utf-8') as f:
+            stopwords_file = self.data_dir / 'korean_stopwords.txt'
+            with open(stopwords_file, 'r', encoding='utf-8') as f:
                 return set(f.read().splitlines())
         except FileNotFoundError:
             # Default basic Korean stopwords
             return {'이', '그', '저', '것', '수', '등', '들', '및', '에서', '으로', '를', '에', '의', '가', '은', '는', '이런', '저런', '그런'}
     
-    def _tokenize_korean_text(self, text):
+    def _tokenize_korean_text(self, text: str) -> str:
         """Preprocess Korean text with specialized handling"""
-        if not isinstance(text, str):
+        if not isinstance(text, str) or not text.strip():
             return ""
         
-        # Normalize text
-        text = text.lower()
+        try:
+            # Normalize text
+            text = text.lower().strip()
+            
+            # Remove special characters but keep Korean, English, numbers
+            text = re.sub(r'[^\wㄱ-ㅎㅏ-ㅣ가-힣 ]', ' ', text)
+            
+            # Remove extra whitespace
+            text = re.sub(r'\s+', ' ', text)
+            
+            # Tokenize Korean text and select only nouns, adjectives, verbs
+            tokens = self.okt.pos(text)
+            filtered_tokens = [
+                word for word, pos in tokens 
+                if (pos in ['Noun', 'Adjective', 'Verb'] and 
+                    len(word) > 1 and 
+                    word not in self.korean_stopwords)
+            ]
+            
+            return ' '.join(filtered_tokens)
         
-        # Remove special characters but keep Korean, English, numbers
-        text = re.sub(r'[^\wㄱ-ㅎㅏ-ㅣ가-힣 ]', ' ', text)
-        
-        # Tokenize Korean text and select only nouns, adjectives, verbs
-        tokens = self.okt.pos(text)
-        filtered_tokens = [word for word, pos in tokens if (pos in ['Noun', 'Adjective', 'Verb'] and 
-                                                           len(word) > 1 and 
-                                                           word not in self.korean_stopwords)]
-        
-        return ' '.join(filtered_tokens)
+        except Exception as e:
+            logger.error(f"Error tokenizing Korean text: {e}")
+            return ""
 
     def reduce_dimensions(self, features: Union[np.ndarray, scipy.sparse.spmatrix], 
                           n_components: int = None) -> np.ndarray:
@@ -135,10 +109,15 @@ class ContentBasedRecommender:
         if n_components is None:
             n_components = self.n_components
             
+        # Don't reduce if already smaller than target
+        if features.shape[1] <= n_components:
+            logger.info(f"Features already have {features.shape[1]} dimensions, skipping reduction")
+            return features.toarray() if scipy.sparse.issparse(features) else features
+            
         logger.info(f"Reducing dimensions from {features.shape[1]} to {n_components}")
         
-        # Check if we should use sparse or dense PCA
-        if isinstance(features, scipy.sparse.spmatrix) and features.shape[1] > 1000:
+        # Check if we should use sparse or dense dimensionality reduction
+        if scipy.sparse.issparse(features) and features.shape[1] > 1000:
             # For very large sparse matrices, use TruncatedSVD
             if self.dimension_reducer is None:
                 self.dimension_reducer = TruncatedSVD(n_components=n_components, random_state=42)
@@ -147,7 +126,7 @@ class ContentBasedRecommender:
                 reduced_features = self.dimension_reducer.transform(features)
         else:
             # For dense matrices or smaller sparse matrices, use PCA
-            if isinstance(features, scipy.sparse.spmatrix):
+            if scipy.sparse.issparse(features):
                 features = features.toarray()
                 
             if self.dimension_reducer is None:
@@ -161,7 +140,7 @@ class ContentBasedRecommender:
 
     def preprocess_text(self, df: pd.DataFrame) -> pd.DataFrame:
         """Preprocess Korean text columns (title and description)"""
-        logger.info(f"Preprocessing text for {len(df)} videos")
+        logger.info(f"Preprocessing text for {len(df)} videos...")
         start_time = time.perf_counter()
         # Create copies to avoid modifying the original dataframe
         df_processed = df.copy()
@@ -178,7 +157,7 @@ class ContentBasedRecommender:
     
     def extract_text_features(self, df: pd.DataFrame) -> np.ndarray:
         """Extract TF-IDF features from preprocessed text"""
-        logger.info("Extracting text features")
+        logger.info("Extracting text features...")
         start_time = time.perf_counter()
         if self.text_vectorizer is None:
             # Initialize and fit vectorizer if not already done
@@ -187,7 +166,8 @@ class ContentBasedRecommender:
                 max_df=0.95, 
                 max_features=5000, 
                 ngram_range=(1, 2), 
-                sublinear_tf=True
+                sublinear_tf=True,
+                lowercase=True
             )
             text_features = self.text_vectorizer.fit_transform(df['text_combined'])
         else:
@@ -204,21 +184,48 @@ class ContentBasedRecommender:
     
     def extract_metadata_features(self, df: pd.DataFrame) -> np.ndarray:
         """Extract and encode numerical and categorical metadata features"""
-        logger.info("Extracting metadata features")
+        logger.info("Extracting metadata features...")
         start_time = time.perf_counter()
-        # Handle numerical features
-        numerical_features = df[['trees_consumed', 'video_duration']].values
-        scaled_numerical = self.numerical_scaler.fit_transform(numerical_features)
+
+        # Handle numerical features with proper error handling
+        numerical_cols = ['trees_consumed', 'video_duration']
+        missing_cols = [col for col in numerical_cols if col not in df.columns]
+        if missing_cols:
+            logger.warning(f"Missing numerical columns: {missing_cols}")
+            # Fill missing columns with zeros
+            for col in missing_cols:
+                df[col] = 0
         
-        # Handle categorical features
-        categorical_features = df[['purchase_tier', 'pd_category']].values
-        encoded_categorical = self.categorical_encoder.fit_transform(categorical_features).toarray()
+        numerical_features = df[numerical_cols].fillna(0).values
+        
+        # Fit scaler if not already fitted
+        if not hasattr(self.numerical_scaler, 'scale_'):
+            scaled_numerical = self.numerical_scaler.fit_transform(numerical_features)
+        else:
+            scaled_numerical = self.numerical_scaler.transform(numerical_features)
+        
+        # Handle categorical features with proper error handling
+        categorical_cols = ['purchase_tier', 'pd_category']
+        missing_cols = [col for col in categorical_cols if col not in df.columns]
+        if missing_cols:
+            logger.warning(f"Missing categorical columns: {missing_cols}")
+            # Fill missing columns with 'unknown'
+            for col in missing_cols:
+                df[col] = ''
+        
+        categorical_features = df[categorical_cols].fillna('').values
+        
+        # Fit encoder if not already fitted
+        if not hasattr(self.categorical_encoder, 'categories_'):
+            encoded_categorical = self.categorical_encoder.fit_transform(categorical_features).toarray()
+        else:
+            encoded_categorical = self.categorical_encoder.transform(categorical_features).toarray()
         
         # Combine all metadata features
         metadata_features = np.hstack((scaled_numerical, encoded_categorical))
 
         end_time = time.perf_counter()
-        logger.info(f"Total execution time: {end_time - start_time:.4f} seconds.")
+        logger.info(f"Metadata feature extraction completed in {end_time - start_time:.4f} seconds")
         return metadata_features
     
     def combine_features(self, 
@@ -234,49 +241,51 @@ class ContentBasedRecommender:
         Returns:
             Combined feature matrix
         """
-        logger.info(f"Combining features with text_weight={text_weight}")
+        logger.info(f"Combining features with text_weight={text_weight}...")
         start_time = time.perf_counter()
+
+        # Validate inputs
+        if text_features.shape[0] != metadata_features.shape[0]:
+            raise ValueError(f"Feature matrices have different number of samples: "
+                           f"{text_features.shape[0]} vs {metadata_features.shape[0]}")
         
-        # Get dimensions
-        n_samples = metadata_features.shape[0]
-        
-        # For metadata features - normalize in-place if possible
-        metadata_norm = np.linalg.norm(metadata_features, axis=1, keepdims=True)
-        np.divide(metadata_features, np.maximum(metadata_norm, 1e-10), out=metadata_features)
-        
-        # Apply weight to metadata
-        metadata_features *= (1 - text_weight)
+        # Ensure text_weight is valid
+        text_weight = max(0.0, min(1.0, text_weight))
+        metadata_weight = 1.0 - text_weight
         
         # Process text features efficiently based on their type
-        if isinstance(text_features, scipy.sparse.spmatrix):
-            # For sparse matrices, we handle differently to preserve memory
-            # Normalize sparse matrix (this preserves sparsity)
+        if scipy.sparse.issparse(text_features):
+            # For sparse matrices, normalize while preserving sparsity
             text_squared = text_features.copy()
             text_squared.data **= 2
             text_norm = np.sqrt(text_squared.sum(axis=1).A1)
             
-            # Create a diagonal matrix of normalization factors
+            # Create normalizer with safe division
             normalizer = scipy.sparse.diags(1.0 / np.maximum(text_norm, 1e-10))
             
-            # Normalize and apply weight (still sparse)
+            # Normalize and apply weight
             text_normalized = normalizer @ text_features
             text_normalized *= text_weight
             
-            # Now we need to combine - convert text to dense only at the final step
-            logger.info("Converting sparse text features to dense for final combination")
-            combined_features = np.hstack((text_normalized.toarray(), metadata_features))
+            # Convert to dense for final combination
+            text_features_final = text_normalized.toarray()
         else:
-            # If already dense, normalize with np operations
+            # Dense text features
             text_norm = np.linalg.norm(text_features, axis=1, keepdims=True)
-            text_features /= np.maximum(text_norm, 1e-10)
-            text_features *= text_weight
-            
-            # Combine
-            combined_features = np.hstack((text_features, metadata_features))
+            text_features_final = text_features / np.maximum(text_norm, 1e-10)
+            text_features_final *= text_weight
+        
+        # Process metadata features
+        metadata_norm = np.linalg.norm(metadata_features, axis=1, keepdims=True)
+        metadata_normalized = metadata_features / np.maximum(metadata_norm, 1e-10)
+        metadata_normalized *= metadata_weight
+        
+        # Combine features
+        combined_features = np.hstack((text_features_final, metadata_normalized))
         
         end_time = time.perf_counter()
-        logger.info(f"Total execution time: {end_time - start_time:.4f} seconds. " 
-                f"Combined shape: {combined_features.shape}")
+        logger.info(f"Feature combination completed in {end_time - start_time:.4f} seconds. "
+                   f"Combined shape: {combined_features.shape}")
         
         # Report memory usage
         mem_usage = combined_features.nbytes / (1024 * 1024)
@@ -287,32 +296,40 @@ class ContentBasedRecommender:
     def configure_faiss_index(self, feature_dim: int, num_videos: int = None) -> None:
         """Select appropriate FAISS index type based on data size and dimensions"""
 
-        if num_videos is None and self.index is not None:
-            num_videos = self.index.ntotal
-        elif num_videos is None:
+        if num_videos is None:
             num_videos = 10000  # Default assumption
             
-        logger.info(f"Configuring FAISS index for {num_videos} videos with {feature_dim} dimensions")
+        logger.info(f"Configuring FAISS index for {num_videos} videos with {feature_dim} dimensions...")
         
         if num_videos < 10000:
-            # For small datasets, exact search is efficient enough
+            # For small datasets, exact search is efficient
             self.index = faiss.IndexFlatL2(feature_dim)
             logger.info("Using FlatL2 index for exact search")
         elif num_videos < 100000:
-            # For medium datasets, use IVF with 4√n clusters
-            n_clusters = int(4 * math.sqrt(num_videos))
+            # For medium datasets, use IVF with optimized cluster count
+            n_clusters = min(int(4 * math.sqrt(num_videos)), num_videos // 10)
+            n_clusters = max(n_clusters, 1)  # Ensure at least 1 cluster
+            
             quantizer = faiss.IndexFlatL2(feature_dim)
             self.index = faiss.IndexIVFFlat(quantizer, feature_dim, n_clusters)
             logger.info(f"Using IVFFlat index with {n_clusters} clusters")
         else:
             # For large datasets, use HNSW for better scalability
             self.index = faiss.IndexHNSWFlat(feature_dim, 32)  # 32 neighbors per node
+            self.index.hnsw.efConstruction = 200  # Build-time search depth
+            self.index.hnsw.efSearch = 128       # Query-time search depth
             logger.info("Using HNSWFlat index for large-scale search")
+
     
     def build_faiss_index(self, feature_matrix: np.ndarray) -> None:
         """Build FAISS index for fast similarity search"""
-        logger.info(f"Building FAISS index with {feature_matrix.shape[0]} videos")
+        logger.info(f"Building FAISS index with {feature_matrix.shape[0]} videos...")
         start_time = time.perf_counter()
+
+        # Validate input
+        if feature_matrix.size == 0:
+            raise ValueError("Feature matrix is empty")
+        
         # Convert to float32 as required by FAISS
         features_float32 = feature_matrix.astype(np.float32)
         
@@ -322,9 +339,10 @@ class ContentBasedRecommender:
             self.configure_faiss_index(dimension, feature_matrix.shape[0])
         
         # Some index types need training before adding vectors
-        if hasattr(self.index, 'train'):
-            logger.info("Training FAISS index")
-            self.index.train(features_float32)
+        if hasattr(self.index, 'train') and hasattr(self.index, 'is_trained'):
+            if not self.index.is_trained:
+                logger.info("Training FAISS index")
+                self.index.train(features_float32)
         
         # Add vectors to the index
         self.index.add(features_float32)
@@ -335,8 +353,12 @@ class ContentBasedRecommender:
 
     def fit(self, video_data: pd.DataFrame) -> None:
         """Fit the recommendation model on the provided video data"""
-        logger.info(f"Fitting model on {len(video_data)} videos")
+        logger.info(f"Fitting model on {len(video_data)} videos...")
         start_time = time.perf_counter()
+
+        if len(video_data) == 0:
+            raise ValueError("Video data is empty")
+        
         # Store original video IDs for mapping
         original_indices = video_data.index.tolist()
         
@@ -365,33 +387,50 @@ class ContentBasedRecommender:
 
     def find_similar_videos(self, video_id: int, top_n: int = 10) -> List[Tuple[int, float]]:
         """Find videos similar to the given video ID with optional caching"""
+        # Validate inputs
+        if top_n <= 0:
+            logger.warning(f"Invalid top_n value: {top_n}, using default of 10")
+            top_n = 10
+        
         # Handle caching based on strategy
-        if self.use_cache:
-            if hasattr(self, 'cache') and self.cache is not None:
-                # Redis cache implementation
-                cache_key = f"sim_videos:{video_id}:{top_n}"
-                cached_result = self.cache.get(cache_key)
-                
-                if cached_result:
-                    self.cache_hits += 1
-                    logger.info(f"Cache hit for video_id={video_id}")
-                    return pickle.loads(cached_result)
-                else:
-                    self.cache_misses += 1
+        if self.use_cache and self.cache_manager:
+            cache_key = self.cache_manager._generate_cache_key(
+                "sim_videos", video_id, top_n
+            )
             
-            elif hasattr(self, 'cached_find_similar'):
-                # Local LRU cache implementation
-                return self.cached_find_similar(video_id, top_n)
+            cached_result = self.cache_manager.get(cache_key)
+            if cached_result is not None:
+                logger.debug(f"Cache hit for video_id={video_id}, top_n={top_n}")
+                return cached_result
         
         # Cache miss or no cache, perform actual search
-        return self._find_similar_videos_internal(video_id, top_n)
+        result = self._find_similar_videos_internal(video_id, top_n)
+        
+        # Store result in cache if caching is enabled
+        if self.use_cache and self.cache_manager and result:
+            cache_key = self.cache_manager._generate_cache_key(
+                "sim_videos", video_id, top_n
+            )
+            self.cache_manager.set(cache_key, result, self.cache_ttl)
+        
+        return result
 
     def _find_similar_videos_internal(self, video_id: int, top_n: int = 10) -> List[Tuple[int, float]]:
         """Find videos similar to the given video ID"""
         
-        logger.info(f"Finding {top_n} videos similar to video_id={video_id}")
+        logger.debug(f"Finding {top_n} videos similar to video_id={video_id}")
+
+        if self.index is None:
+            logger.error("Model not fitted. Call fit() first.")
+            return []
         
         try:
+
+            # Get the index of the video in our processed data
+            if video_id not in self.id_mapping.values():
+                logger.warning(f"Video ID {video_id} not found in training data")
+                return []
+            
             # Get the index of the video in our processed data
             video_idx = list(self.id_mapping.values()).index(video_id)
             
@@ -399,62 +438,67 @@ class ContentBasedRecommender:
             query_vector = np.array([self.index.reconstruct(video_idx)]).astype(np.float32)
             
             # Search for similar videos
-            k = top_n + 1  # +1 because the video itself will be included
+            k = min(top_n + 1, self.index.ntotal)  # +1 because the video itself will be included
             distances, indices = self.index.search(query_vector, k)
             
             # Convert to list of (video_id, similarity_score) tuples
             # Skip the first result (which is the query video itself)
             similar_videos = []
             for i, idx in enumerate(indices[0]):
-                if self.id_mapping[idx] != video_id:  # Skip the query video
+                if idx == -1:  # FAISS returns -1 for invalid indices
+                    continue
+                    
+                current_video_id = self.id_mapping[idx]
+                if current_video_id != video_id:  # Skip the query video
                     # Convert distance to similarity score (1 / (1 + distance))
-                    similarity = 1 / (1 + distances[0][i])
-                    similar_videos.append((self.id_mapping[idx], float(similarity)))
+                    similarity = 1.0 / (1.0 + float(distances[0][i]))
+                    similar_videos.append((current_video_id, similarity))
                 
-                if len(similar_videos) == top_n:
+                if len(similar_videos) >= top_n:
                     break
             
-            # Cache the result if caching is enabled
-            if self.use_cache and hasattr(self, 'cache') and self.cache is not None:
-                cache_key = f"sim_videos:{video_id}:{top_n}"
-                self.cache.setex(cache_key, self.cache_ttl, pickle.dumps(similar_videos))
+            # Sort by similarity score (descending)
+            similar_videos.sort(key=lambda x: x[1], reverse=True)
             
+            logger.debug(f"Found {len(similar_videos)} similar videos for video_id={video_id}")
             return similar_videos
         
         except Exception as e:
-            logger.error(f"Error finding similar videos: {str(e)}")
+            logger.error(f"Error finding similar videos for video_id={video_id}: {str(e)}")
             return []
         
-    def save_models(self) -> None:
+    def save_models(self) -> bool:
         """Save trained models and preprocessors to disk"""
-        logger.info(f"Saving models to {self.model_dir}")
+        logger.info(f"Saving models to {self.model_dir}...")
         start_time = time.perf_counter()
-        # Save text vectorizer
-        with open(os.path.join(self.model_dir, "text_vectorizer.pkl"), "wb") as f:
-            pickle.dump(self.text_vectorizer, f)
+        try:
+            self.model_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Save FAISS index
+            if self.index is not None:
+                faiss.write_index(self.index, str(self.model_dir / "faiss_index.bin"))
+            
+            # Save other components
+            components = {
+                'text_vectorizer': self.text_vectorizer,
+                'numerical_scaler': self.numerical_scaler,
+                'categorical_encoder': self.categorical_encoder,
+                'dimension_reducer': self.dimension_reducer,
+                'id_mapping': self.id_mapping,
+                'korean_stopwords': self.korean_stopwords
+            }
+            
+            with open(self.model_dir / "components.pkl", 'wb') as f:
+                pickle.dump(components, f)
+            
+            logger.info(f"Models saved to {self.model_dir}")
+            logger.info(f"Total execution time: {time.perf_counter() - start_time:.4f} seconds.")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error saving models: {e}")
+            return False
         
-        # Save numerical scaler
-        with open(os.path.join(self.model_dir, "numerical_scaler.pkl"), "wb") as f:
-            pickle.dump(self.numerical_scaler, f)
-        
-        # Save categorical encoder
-        with open(os.path.join(self.model_dir, "categorical_encoder.pkl"), "wb") as f:
-            pickle.dump(self.categorical_encoder, f)
-        
-        # Save FAISS index
-        faiss.write_index(self.index, os.path.join(self.model_dir, "faiss_index.bin"))
-
-        if hasattr(self, 'dimension_reducer') and self.dimension_reducer is not None:
-            with open(self.model_dir / "dimension_reducer.pkl", "wb") as f:
-                pickle.dump(self.dimension_reducer, f, protocol=pickle.HIGHEST_PROTOCOL)
-        
-        # Save ID mapping
-        with open(os.path.join(self.model_dir, "id_mapping.pkl"), "wb") as f:
-            pickle.dump(self.id_mapping, f)
-        
-        end_time = time.perf_counter()
-        logger.info("Models saved successfully")
-        logger.info(f"Total execution time: {end_time - start_time:.4f} seconds.")
 
     def load_models(self) -> bool:
         """Load trained models and preprocessors from disk
@@ -465,33 +509,25 @@ class ContentBasedRecommender:
         logger.info(f"Loading models from {self.model_dir}")
         
         try:
-            # Load text vectorizer
-            with open(self.model_dir / "text_vectorizer.pkl", "rb") as f:
-                self.text_vectorizer = pickle.load(f)
-            
-            # Load numerical scaler
-            with open(self.model_dir / "numerical_scaler.pkl", "rb") as f:
-                self.numerical_scaler = pickle.load(f)
-            
-            # Load categorical encoder
-            with open(self.model_dir / "categorical_encoder.pkl", "rb") as f:
-                self.categorical_encoder = pickle.load(f)
-            
-            # Load dimension reducer if it exists
-            dimension_reducer_path = self.model_dir / "dimension_reducer.pkl"
-            if dimension_reducer_path.exists():
-                with open(dimension_reducer_path, "rb") as f:
-                    self.dimension_reducer = pickle.load(f)
-                    logger.info("Dimension reducer loaded")
-            
             # Load FAISS index
-            self.index = faiss.read_index(str(self.model_dir / "faiss_index.bin"))
+            index_path = self.model_dir / "faiss_index.bin"
+            if index_path.exists():
+                self.index = faiss.read_index(str(index_path))
             
-            # Load ID mapping
-            with open(self.model_dir / "id_mapping.pkl", "rb") as f:
-                self.id_mapping = pickle.load(f)
+            # Load other components
+            components_path = self.model_dir / "components.pkl"
+            if components_path.exists():
+                with open(components_path, 'rb') as f:
+                    components = pickle.load(f)
                 
-            logger.info("Models loaded successfully")
+                self.text_vectorizer = components.get('text_vectorizer')
+                self.numerical_scaler = components.get('numerical_scaler')
+                self.categorical_encoder = components.get('categorical_encoder')
+                self.dimension_reducer = components.get('dimension_reducer')
+                self.id_mapping = components.get('id_mapping', {})
+                self.korean_stopwords = components.get('korean_stopwords', set())
+            
+            logger.info(f"Models loaded from {self.model_dir}")
             return True
         
         except FileNotFoundError as e:
