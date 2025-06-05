@@ -195,11 +195,6 @@ class HybridRecommendationService:
                             video_id=vid_id, top_n=n_similar
                         )
                         
-                        # Mock data for demonstration
-                        similar_vids = [
-                            f"{vid_id}_similar_{i}" for i in range(n_similar)
-                        ]
-                        
                         for similar_vid in similar_vids:
                             similar_vid_id = similar_vid[0] if isinstance(similar_vid, tuple) else similar_vid
                             
@@ -343,7 +338,24 @@ async def clear_cache(
     """Clear recommendation cache"""
     cleared_count = service.clear_cache()
     return {"message": f"Cleared {cleared_count} cached recommendations"}
-  
+
+
+
+@app.get("/health", response_model=HealthResponse)
+async def health_check():
+    """Health check endpoint"""
+    import datetime
+    
+    # Check if service is available without raising an exception
+    global recommender_service
+    models_loaded = recommender_service is not None and recommender_service.models_loaded if recommender_service else False
+    
+    return HealthResponse(
+        status="healthy" if models_loaded else "unhealthy",
+        timestamp=datetime.datetime.now().isoformat(),
+        models_loaded=models_loaded,
+        version="1.0.0"
+    )
 
 @app.get("/")
 async def root():
@@ -356,11 +368,11 @@ async def root():
     }
 
 # For local development, uncomment this code
-# if __name__ == "__main__":
-#     uvicorn.run(
-#         "api:app",
-#         host="0.0.0.0",
-#         port=8000,
-#         reload=True,  # Enable auto-reload during development
-#         log_level="info"
-#     )
+if __name__ == "__main__":
+    uvicorn.run(
+        "api:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True,  # Enable auto-reload during development
+        log_level="info"
+    )
