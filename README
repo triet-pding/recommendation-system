@@ -1,29 +1,70 @@
-# 🧠 Project Name: PDing Video Recommendation System 
+# PDing Video Recommendation System 
 
-This is the 
+This is the Hybrid Recommendation System for PDing platform
 
----
+## Overview
 
-## 📌 Table of Contents
+This project aims to  recommend related videos for PDing' users using Collaborative Filtering and Content-Based approaches.
 
-- [Overview](#overview)
-- [Project Structure](#project-structure)
-- [Installation](#installation)
-- [Usage](#usage)
-- [Model Architecture](#model-architecture)
-- [Training Details](#training-details)
-- [Results](#results)
-- [Evaluation Metrics](#evaluation-metrics)
-- [Contributing](#contributing)
-- [License](#license)
+## Recommendation Approaches
 
----
+### 1. Collaborative Filtering
+- Uses historical user-video interactions (currently using **rating score**)
+- Matrix-based approach with similarity metrics like **cosine similarity** or **alternating least squares (ALS)**
 
-## 🧾 Overview
+### 2. Content-Based Filtering
+- Uses video metadata such as:
+  - title
+  - description
+  - trees_consumed
+  - video_duration
+  - purchase_tier
+  - pd_category
+- Computes video-video similarity using **TF-IDF**
 
-This project aims to solve **[insert problem]** using **[e.g., supervised learning, deep learning, NLP]** techniques. It uses a dataset of **[describe dataset briefly]** to train and evaluate a model that can **[brief project goal]**.
+### 3. Hybrid Model
+- Combines collaborative top-N results with content-similar expansion
+- Handles cold-start users and items
 
----
+## Features
+- **Collaborative Filtering** using user-video interactions
+- **Content-Based Filtering** using video attributes 
+- Hybrid logic for improved cold-start handling
+- Caching layer **(Redis + Memory cache)** for I/O bound task optimization
+- Configurable pipeline and scoring
+- REST API via FastAPI for real-time recommendations
+- Unit tests and reusable components
 
-## 📂 Project Structure
+## Installation
+### Prerequisite: 
+* Python 3.10.12
+* Docker
+* docker-compose
+* git
+* virtualenv
+* CUDA
 
+1. Create production environment
+```
+# Create env
+virtual env
+source venv/bin/activate
+
+# Install libraries
+pip install -r requirements.txt
+```
+
+2. Prepare data for model training
+```
+bash data_preparing.sh
+```
+
+3. Model training
+```
+bash model_training.sh
+```
+
+4. Project serving and API hosting
+```
+docker-compose up -d --build 
+```
