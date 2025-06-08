@@ -25,7 +25,7 @@ COPY requirements_gpu.txt .
 
 # Install Python dependencies
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+    pip install --no-cache-dir -r requirements_gpu.txt
 
 # Copy application code
 COPY . /app
