@@ -52,7 +52,7 @@ virtual env
 source venv/bin/activate
 
 # Install libraries
-pip install -r requirements.txt
+pip install -r requirements_cpu.txt
 ```
 
 2. Prepare data for model training

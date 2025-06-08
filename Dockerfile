@@ -21,7 +21,7 @@ ENV JAVA_HOME=/usr/lib/jvm/default-java
 ENV PATH=$PATH:$JAVA_HOME/bin
 
 # Copy requirements first (for better Docker layer caching)
-COPY requirements.txt .
+COPY requirements_gpu.txt .
 
 # Install Python dependencies
 RUN pip install --no-cache-dir --upgrade pip && \
