@@ -42,7 +42,8 @@ This project aims to  recommend related videos for PDing' users using Collaborat
 * docker-compose
 * git
 * virtualenv
-* CUDA
+* CUDA (change the package faiss-gpu to faiss cpu if CUDA bot compatible)
+
 
 1. Create production environment
 ```
